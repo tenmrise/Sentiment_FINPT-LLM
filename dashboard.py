@@ -18,7 +18,7 @@ from langchain_community.llms import HuggingFacePipeline
 from langchain_community.utilities.google_serper import GoogleSerperAPIWrapper
 
 # ==============================================================================
-# 1. CORE PIPELINE LOGIC (Unchanged)
+# 1. CORE PIPELINE LOGIC
 # ==============================================================================
 
 # --------  CONFIG  --------
@@ -31,7 +31,7 @@ CONFIG = {
     "fingpt_model": "FinGPT/fingpt-sentiment_llama2-13b_lora",
 }
 
-# --------  API KEYS & MODELS (with caching) --------
+# --------  API KEYS & MODELS (with caching and deployment fix) --------
 @st.cache_resource
 def load_models_and_keys():
     """Load API keys from .env and initialize models once."""
@@ -49,7 +49,9 @@ def load_models_and_keys():
         "summarizer_llm": ChatOpenAI(model=CONFIG["summarizer_model"], temperature=0.2, api_key=keys["OPENAI_API_KEY"]),
         "verifier_llm": ChatOpenAI(model=CONFIG["verifier_model"], temperature=0.0, api_key=keys["OPENAI_API_KEY"]),
         "analyst_llm": ChatGoogleGenerativeAI(model=CONFIG["analyst_model"], temperature=0.0, model_kwargs={"response_mime_type": "application/json"}, api_key=keys["GOOGLE_API_KEY"]),
-        "fingpt": HuggingFacePipeline(model_id=CONFIG["fingpt_model"], task="text-classification", device_map="auto", return_all_scores=True)
+        
+        # --- FIX: Removed device_map="auto" for Streamlit Cloud (CPU-only) compatibility ---
+        "fingpt": HuggingFacePipeline(model_id=CONFIG["fingpt_model"], task="text-classification", return_all_scores=True)
     }
     return keys, models
 
@@ -81,7 +83,7 @@ aggregate_prompt = ChatPromptTemplate.from_messages([
     ("human", "Sentiment Data:\n{sent}\n\nFinancial Data:\n{fin}\n\nVerification Notes:\n{corr}")
 ])
 
-# --------  NODE HELPERS (with robust financial analysis) --------
+# --------  NODE HELPERS --------
 def fetch_news(state: PipelineState) -> PipelineState:
     serper = GoogleSerperAPIWrapper(type_="news")
     out = {}
@@ -144,16 +146,13 @@ def analyse_finance_data(state: PipelineState) -> PipelineState:
     if state["prices_raw"].empty:
         state["finance_analysis"] = {t: {"error": "Missing price data"} for t in state["tickers"]}
         return state
-
     analysis = {}
-    # --- IMPROVEMENT: More robust handling for single vs. multiple tickers ---
     if isinstance(state['prices_raw'].columns, pd.MultiIndex):
         df_full = state["prices_raw"].stack(level=1).rename_axis(['Date', 'Ticker']).reset_index()
-    else: # Handle single ticker case
+    else:
         df_full = state['prices_raw'].copy()
         df_full['Ticker'] = state['tickers'][0]
         df_full = df_full.reset_index()
-
     for ticker in state["tickers"]:
         df = df_full[df_full['Ticker'] == ticker].dropna()
         if len(df) < 2:
@@ -189,18 +188,14 @@ def aggregate(state: PipelineState, aggregate_chain) -> PipelineState:
 # ==============================================================================
 
 st.set_page_config(layout="wide", page_title="Financial Sentiment Dashboard")
-
 st.title("Financial News & Sentiment Analysis Dashboard")
 st.markdown("An interactive dashboard to analyze financial news sentiment and price data using a multi-agent LLM pipeline.")
 
-# --- Load Models and API Keys ---
 api_keys, models = load_models_and_keys()
-
 if not models:
-    st.error("🚨 **API Keys Not Found!** Please add `OPENAI_API_KEY`, `GOOGLE_API_KEY`, and `SERPER_API_KEY` to a `.env` file.")
+    st.error("🚨 **API Keys Not Found!** Please add `OPENAI_API_KEY`, `GOOGLE_API_KEY`, and `SERPER_API_KEY` to your Streamlit Secrets.")
     st.stop()
 
-# --- Chain definitions that depend on loaded models ---
 summary_chain = summary_prompt | models['summarizer_llm'] | StrOutputParser()
 verify_chain = verify_prompt | models['verifier_llm'] | StrOutputParser()
 aggregate_chain = aggregate_prompt | models['analyst_llm'] | JsonOutputParser()
@@ -226,69 +221,45 @@ def run_pipeline(tickers, start_date, end_date):
     initial_state = { "tickers": tickers, "start": start_date, "end": end_date, "errors": [] }
     return pipeline.invoke(initial_state)
 
-# --- Sidebar for User Inputs ---
 st.sidebar.header("Analysis Configuration")
-
-# --- Dynamic Ticker Input ---
 if 'available_tickers' not in st.session_state:
     st.session_state.available_tickers = ['NVDA', 'GOOGL', 'MSFT', 'AAPL', 'TSLA', 'AMZN', 'META']
-
 new_ticker = st.sidebar.text_input("Add Ticker Symbol", placeholder="e.g., CRM").strip().upper()
-
 if st.sidebar.button("Add Ticker"):
     if new_ticker and new_ticker not in st.session_state.available_tickers:
         st.session_state.available_tickers.append(new_ticker)
-    elif not new_ticker:
-        st.sidebar.warning("Please enter a ticker symbol.")
-    else:
-        st.sidebar.warning(f"{new_ticker} is already in the list.")
-
-selected_tickers = st.sidebar.multiselect(
-    "Select Stock Tickers for Analysis",
-    options=st.session_state.available_tickers,
-    default=['NVDA', 'MSFT']
-)
-
-# --- Date Inputs ---
+    elif not new_ticker: st.sidebar.warning("Please enter a ticker symbol.")
+    else: st.sidebar.warning(f"{new_ticker} is already in the list.")
+selected_tickers = st.sidebar.multiselect("Select Stock Tickers for Analysis", options=st.session_state.available_tickers, default=['NVDA', 'MSFT'])
 today = dt.date.today()
 start_date = st.sidebar.date_input("Start Date", value=today - dt.timedelta(days=7))
 end_date = st.sidebar.date_input("End Date", value=today)
 
-# --- Run Button ---
 if st.sidebar.button("🚀 Run Analysis", type="primary"):
-    if not selected_tickers:
-        st.warning("Please select at least one ticker.")
-    elif start_date >= end_date:
-        st.warning("Start Date must be before End Date.")
+    if not selected_tickers: st.warning("Please select at least one ticker.")
+    elif start_date >= end_date: st.warning("Start Date must be before End Date.")
     else:
         with st.spinner("Analyzing... This may take a few minutes. Processing news, financials, and running LLM agents..."):
             st.session_state.final_state = run_pipeline(selected_tickers, start_date, end_date)
 
-# --- Main Content Area for Displaying Results ---
 if 'final_state' in st.session_state:
     state = st.session_state.final_state
     if state.get("errors"):
         st.error("### Errors Occurred During Analysis")
-        for error in state["errors"]:
-            st.code(error)
-
+        for error in state["errors"]: st.code(error)
     tab_titles = ["📈 Summary Report"] + [f"{ticker} Details" for ticker in state["tickers"]]
     tabs = st.tabs(tab_titles)
-
     with tabs[0]:
         st.header("Chief Investment Strategist Report")
         report_data = state.get("report")
         if report_data and "error" not in report_data: st.json(report_data)
         else: st.warning("Could not generate the final report.")
-        
         st.subheader("Verification Notes"); st.write(state.get("verification", "No verification notes."))
-
     for i, ticker in enumerate(state["tickers"]):
         with tabs[i+1]:
             st.header(f"Detailed Analysis for {ticker}")
             st.subheader("Financial Overview")
             fin_analysis = state.get("finance_analysis", {}).get(ticker, {})
-            
             if "error" in fin_analysis:
                 st.warning(f"Could not perform financial analysis for {ticker}: {fin_analysis['error']}")
             else:
@@ -300,11 +271,9 @@ if 'final_state' in st.session_state:
                     ticker_prices = prices_df.loc[:, pd.IndexSlice[:, ticker]] if isinstance(prices_df.columns, pd.MultiIndex) else prices_df
                     fig = px.line(ticker_prices, y="Close", title=f"{ticker} Stock Price", labels={"Date": "Date", "Close": "Closing Price (USD)"})
                     st.plotly_chart(fig, use_container_width=True)
-
             st.subheader("News Sentiment Analysis")
             sentiment_data = state.get("sentiment_scored", {}).get(ticker, [])
             if not sentiment_data: st.info(f"No news articles found or processed for {ticker}.")
-            
             for item in sentiment_data:
                 with st.expander(f"**{item.get('published', 'Date N/A')}** | Score: {item.get('sentiment_score', 0)}"):
                     st.markdown(item.get("summary", "No summary available."))
